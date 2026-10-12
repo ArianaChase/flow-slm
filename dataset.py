@@ -50,6 +50,9 @@ class SpeechDataModule(pl.LightningDataModule):
             elif self.args.is_librispeech:
                 print("setting up librispeech dataset for evaluation...")
                 self.test_set = LibriSpeechDataset(sr=self.conf.data.sr)
+            elif self.args.is_synthesis:
+                print("setting up synthesis dataset for evaluation...")
+                self.test_set = SynthesisDataset(self.args, sr=self.conf.data.sr)
             else:
                 self.test_set = SpeechDataset(self.args.predict_id_file, self.args.data_dir,
                                           default_sr=self.conf.data.sr, ext=self.conf.data.ext)
@@ -181,7 +184,6 @@ class SpeechOceanDataset(Dataset):
     def __init__(self, dataset_path: str = "peggy2009/speechocean_with_mfa",
                  split: str = "train", sr: int = 24000):       
         self.dataset = load_dataset(dataset_path, split=split)
-        self.dataset = self.dataset.select(range(10))
         self.dataset = self.dataset.cast_column("path", Audio(decode=False))
 
         self.split = split
@@ -211,6 +213,7 @@ class SpeechOceanDataset(Dataset):
 class LibriSpeechDataset(Dataset):
     def __init__(self, dataset_path: str = "openslr/librispeech_asr", split: str = "validation", sr: int = 24000):
         self.dataset = load_dataset(dataset_path, "clean", split=split, streaming=True)
+        self.dataset = self.dataset.cast_column("audio", Audio(decode=False))
 
         temp_data = []
         for sample in self.dataset:
@@ -225,8 +228,8 @@ class LibriSpeechDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.dataset[idx]
-        audio = torch.Tensor(row['audio']['array'])
-        audio_sr = row['audio']['sampling_rate']
+        audio, audio_sr = sf.read(io.BytesIO(row['audio']['bytes']))
+        audio = torch.from_numpy(audio).float()
 
         if audio_sr != self.sr:
             wav = F.resample(audio, audio_sr, self.sr)
@@ -234,6 +237,53 @@ class LibriSpeechDataset(Dataset):
             wav = audio
 
         uid = f"{row['id']}"
+
+        return uid, wav
+
+from pathlib import Path
+from tqdm import tqdm
+
+def process_synth(input_dataset, audio_version):
+
+    audio_file_info = []
+
+    pbar = tqdm(os.listdir(input_dataset))
+
+    for file_path in pbar:
+        audio_path = f"{input_dataset}/{file_path}"
+        file_metadata = os.path.basename(audio_path).split("_")
+        filename = file_metadata[0]
+        ver = Path(file_metadata[1]).stem
+
+        if ver != audio_version:
+            continue
+
+        audio_file_info.append({
+            "filename" : filename,
+            "audio_version" : ver,
+            "path" : audio_path
+        })
+    return {
+        "processed" : audio_file_info,
+    }
+
+class SynthesisDataset(Dataset):
+    def __init__(self, args, dataset_path: str = "/home/ubuntu/speech_ppl/src/stim_final/setB_audio", sr: int = 24000):
+        self.dataset = process_synth(dataset_path, args.audio_version)['processed']
+        self.sr = sr
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        row = self.dataset[idx]
+        wav, sr = torchaudio.load(row['path'])
+        if wav.dim() == 2:
+            wav = wav[0]
+        if sr != self.sr:
+            wav = F.resample(wav, sr, self.sr)
+
+        uid = f"{row['filename']}"
 
         return uid, wav
 

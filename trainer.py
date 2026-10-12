@@ -5,10 +5,10 @@ the training, validation, and prediction steps for the continuous GSLM model.
 Refactored to split responsibilities into smaller helper methods, fix a couple
 of mode/device issues, and improve readability.
 """
-
+import csv
 import json
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, Audio
 import torch.nn.functional as F
 import lightning.pytorch as pl
 from utils import get_cosine_schedule_with_warmup
@@ -342,6 +342,8 @@ def main():
     parser.add_argument("--predict_only", action="store_true")
     parser.add_argument("--is_speechocean", action="store_true", help="whether the dataset is speechocean, which requires special handling in data loading")
     parser.add_argument("--is_librispeech", action="store_true")
+    parser.add_argument("--is_synthesis", action="store_true")
+    parser.add_argument("--audio_version", type=str)
     parser.add_argument("--split", type=str, default="test", help="which split to evaluate on if --is_speechocean is set")
     parser.add_argument("--training_data", choices=["MLSEn10k", "MLSEn", "MLSEn+people"], default=None)
     parser.add_argument("--valid_id_file", help="Path to validation dataset ids")
@@ -359,6 +361,7 @@ def main():
         choices=["ddp", "ddp_find_unused_parameters_true", "deepspeed_stage_2", "deepspeed_stage_3", "fsdp", "deepspeed_stage_1"],
     )
     parser.add_argument("--root_dir", type=str)
+    parser.add_argument("--output_dir", type=str)
     parser.add_argument("--override", help="override the hyperparameters in conf", default=None, type=str)
 
     args = parser.parse_args()
@@ -487,133 +490,112 @@ def main():
 
         if args.is_speechocean:
             MODEL_TYPE="Flow-SLM"
-            NORM_DICT_DIR = f"{args.root_dir}/src/gslm/tools/result_dicts"
-            SERVICE_ACCOUNT = f"{args.root_dir}/src/service_account.json"
+            MODEL_NAME="Flow-SLM-1Bext"
+            OUTPUT_DIR=args.output_dir
             
             output = extract_timestamps(args, output)
-            for granularity in ["utterance"]:
-                for pool in ["mean", "max", "std"]:
-        
-                    if granularity == "phone" or granularity == "word":
-                        with open(f"{NORM_DICT_DIR}/{MODEL_TYPE}_{granularity}_{pool}_flow_norm.json", "r") as f:
-                            norm_dict_flow = json.load(f)
-                        with open(f"{NORM_DICT_DIR}/{MODEL_TYPE}_{granularity}_{pool}_token_norm.json", "r") as f:
-                            norm_dict_token = json.load(f)
 
-                    else:
-                        norm_dict_flow = None
-                        norm_dict_token = None
-        
-                    results = process_speechocean_outputs(
-                        args,
-                        output, 
-                        granularity=granularity, 
-                        pooling=pool, 
-                        norm_dicts=[norm_dict_flow, norm_dict_token],
-                        token=conf.optimizer.token_loss_weight > 0
-                        )
+            global_token_losses = []
+            global_flow_losses = []
 
-                    ppl_results = results["results"]
-                    nan_percent = (results["nan_count"] / len(ppl_results)) * 100
+            for file_info in output:
+                for idx, token_loss in enumerate(file_info['token_losses_timestamps']):
+                    global_token_losses.append({
+                        "speaker" : file_info['id'][1:5],
+                        "filename" : file_info['id'],
+                        "token_id" : idx,
+                        "ppl_loss" : token_loss[0],
+                        "start" : token_loss[1],
+                        "end" : token_loss[2]
+                    })
 
-                    print(ppl_results)
+                for idx, flow_loss in enumerate(file_info['flow_losses_timestamps']):
+                    global_flow_losses.append({
+                        "speaker" : file_info['id'][1:5],
+                        "filename" : file_info['id'],
+                        'token_id' : idx,
+                        "ppl_loss" : flow_loss[0],
+                        "start" : flow_loss[1],
+                        "end" : flow_loss[2]
+                    })
 
-                    # correlate
-                    df = pd.DataFrame(ppl_results)
+            # === OBSERVE FILE NAMING ===
+            csv_path = f"{OUTPUT_DIR}/{MODEL_TYPE}_{MODEL_NAME}-semantic_per_token_losses.csv"
 
-                    for loss_type in ['Flow-SLM_acoustic', 'Flow-SLM_semantic']:
-                        if loss_type == "Flow-SLM_acoustic":
-                            # default correlation
-                            df_f = df[df["loss_type"] == 'flow']
-                            df_f.dropna(axis=0, subset=df_f.columns.drop('ppl_loss_norm'), inplace=True)
-                            x_f = df_f["ppl_loss"]
-                            y = df_f['human_score']
-                            pcc = scipy.stats.pearsonr(x_f, y)
+            with open(csv_path, "w") as f:
+                fieldnames = global_token_losses[0].keys()
+                dict_writer = csv.DictWriter(f, fieldnames)
+                dict_writer.writeheader()
+                dict_writer.writerows(global_token_losses)
 
-                            # auc
-                            y_score = df_f["ppl_loss"]
-                            y_true = df_f["auc_label"]
-                            if len(np.unique(y_true)) != 1:
-                                auc = roc_auc_score(y_true, y_score)
-                            else:
-                                auc = "n/a"
+            csv_path = f"{OUTPUT_DIR}/{MODEL_TYPE}_{MODEL_NAME}-acoustic_per_token_losses.csv"
 
-                            if granularity != "utterance":
-                                # normalized correlation
-                                df_f_norm = df[df["loss_type"] == 'flow'] # dataframe filtered with only flow metrics
-                                df_f_norm.dropna(axis=0, inplace=True) # drop row if na is involved (na only exists for norm)
-                                x_norm = df_f_norm["ppl_loss_norm"]
-                                y_norm = df_f_norm["human_score"]
-                                if len(x_norm) > 2:
-                                    pcc_norm = scipy.stats.pearsonr(x_norm, y_norm) 
-                                    pcc_norm_stats = pcc_norm.statistic
-                                    pcc_norm_pvalue = pcc_norm.pvalue
-                                else:
-                                    pcc_norm_stats = 'n/a'
-                                    pcc_norm_pvalue = 'n/a'
+            with open(csv_path, "w") as f:
+                fieldnames = global_flow_losses[0].keys()
+                dict_writer = csv.DictWriter(f, fieldnames)
+                dict_writer.writeheader()
+                dict_writer.writerows(global_flow_losses)
 
-                                # normalized auc
-                                y_score_norm = df_f_norm["ppl_loss_norm"]
-                                y_true_norm = df_f_norm["auc_label"]
-                                if len(np.unique(y_true_norm)) != 1:
-                                    auc_norm = roc_auc_score(y_true_norm, y_score_norm)
-                                else:
-                                    auc_norm = "n/a"
-                            else:
-                                pcc_norm_stats = 'n/a'
-                                pcc_norm_pvalue = 'n/a'
-                                auc_norm = "n/a"
+        if args.is_synthesis:
+            MODEL_TYPE="Flow-SLM"
+            MODEL_NAME="Flow-SLM-1Bext"
+            OUTPUT_DIR=args.output_dir
+            
+            output = extract_timestamps(args, output)
 
-                        else:
-                            df_t = df[df["loss_type"] == 'token']
-                            df_t.dropna(axis=0, subset=df_t.columns.drop('ppl_loss_norm'), inplace=True)
-                            x_t = df_t["ppl_loss"]
-                            y = df_t['human_score']
-                            pcc = scipy.stats.pearsonr(x_t, y)
+            global_token_losses = []
+            global_flow_losses = []
 
-                            # auc
-                            y_score = df_t["ppl_loss"]
-                            y_true = df_t["auc_label"]
-                            if len(np.unique(y_true)) != 1:
-                                auc = roc_auc_score(y_true, y_score)
-                            else:
-                                auc = "n/a"
+            for file_info in output:
+                for idx, token_loss in enumerate(file_info['token_losses_timestamps']):
+                    global_token_losses.append({
+                        "speaker" : file_info['id'][1:5],
+                        "filename" : file_info['id'],
+                        "token_id" : idx,
+                        "ppl_loss" : token_loss[0],
+                        "start" : token_loss[1],
+                        "end" : token_loss[2]
+                    })
 
-                            if granularity != "utterance":
-                                # normalized correlation
-                                df_t_norm = df[df["loss_type"] == 'flow'] # dataframe filtered with only flow metrics
-                                df_t_norm.dropna(axis=0, inplace=True) # drop row if na is involved (na only exists for norm)
-                                x_norm = df_t_norm["ppl_loss_norm"]
-                                y_norm = df_t_norm["human_score"]
-                                if len(x_norm) > 2:
-                                    pcc_norm = scipy.stats.pearsonr(x_norm, y_norm)
-                                    pcc_norm_stats = pcc_norm.statistic
-                                    pcc_norm_pvalue = pcc_norm.pvalue
-                                else:
-                                    pcc_norm_stats = 'n/a'
-                                    pcc_norm_pvalue = 'n/a'
+                for idx, flow_loss in enumerate(file_info['flow_losses_timestamps']):
+                    global_flow_losses.append({
+                        "speaker" : file_info['id'][1:5],
+                        "filename" : file_info['id'],
+                        'token_id' : idx,
+                        "ppl_loss" : flow_loss[0],
+                        "start" : flow_loss[1],
+                        "end" : flow_loss[2]
+                    })
 
-                                # normalized auc
-                                y_score_norm = df_t_norm["ppl_loss_norm"]
-                                y_true_norm = df_t_norm["auc_label"]
-                                if len(np.unique(y_true_norm)) != 1:
-                                    auc_norm = roc_auc_score(y_true_norm, y_score_norm)
-                                else:
-                                    auc_norm = "n/a"
-                            else:
-                                pcc_norm_stats = 'n/a'
-                                pcc_norm_pvalue = 'n/a'
-                                auc_norm = "n/a"
-        
-                        # Record in CSV 
-                        append_to_sheet([MODEL_TYPE, loss_type, granularity, pool, pcc.statistic, pcc.pvalue, pcc_norm_stats, pcc_norm_pvalue, auc, auc_norm, f"{nan_percent:2f}" + "%", len(df)], SERVICE_ACCOUNT)
+            # === OBSERVE FILE NAMING ===
+            csv_path = f"{OUTPUT_DIR}/{MODEL_TYPE}_{MODEL_NAME}-semantic_setB_{args.audio_version}_per_token_losses.csv"
+
+            with open(csv_path, "w") as f:
+                fieldnames = global_token_losses[0].keys()
+                dict_writer = csv.DictWriter(f, fieldnames)
+                dict_writer.writeheader()
+                dict_writer.writerows(global_token_losses)
+
+            csv_path = f"{OUTPUT_DIR}/{MODEL_TYPE}_{MODEL_NAME}-acoustic_setB_{args.audio_version}_per_token_losses.csv"
+
+            with open(csv_path, "w") as f:
+                fieldnames = global_flow_losses[0].keys()
+                dict_writer = csv.DictWriter(f, fieldnames)
+                dict_writer.writeheader()
+                dict_writer.writerows(global_flow_losses)
 
         if args.is_librispeech:
             MODEL_TYPE = "Flow-SLM"
-            result_dicts_path = f"{args.root_dir}/src/gslm/tools/result_dicts"
-            data = load_dataset("openslr/librispeech_asr", "clean", split="validation")
+            result_dicts_path = f"{args.root_dir}/src/metrics/result_dicts"
+            data = load_dataset("openslr/librispeech_asr", "clean", split="validation", streaming=True)
+            data = data.cast_column("audio", Audio(decode=False))
+            
             alignments_ds = load_dataset("gilkeyio/librispeech-alignments", streaming=True)
+            alignments_ds = alignments_ds.cast_column("audio", Audio(decode=False))
+            
             alignments_ext = process_alignments_ds(alignments_ds["dev_clean"])
+
+            output = extract_timestamps(args, output)
 
             for gran in ["phone", "word"]:
                 for pool in ["mean", "max", "std"]:
@@ -643,7 +625,7 @@ def main():
                             with open(f"{result_dicts_path}/{MODEL_TYPE}_phone_{pool}_{loss_type}_norm.json", "w") as f:
                                 json.dump(result_dict, f)
                 
-                            with open(f"{args.root_dir}rc/gslm/tools/error_log", "a") as f:
+                            with open(f"{args.root_dir}/src/gslm/tools/error_log", "a") as f:
                                 f.write(f"In total, there are {len(result_dict)} unique phones in the {pool} dictionary.")
                                 f.write("\n")
                                 f.write(f"{sorted(list(result_dict.keys()))}\n")

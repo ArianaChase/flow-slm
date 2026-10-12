@@ -272,9 +272,9 @@ def extract_timestamps(args, output):
         })
 
     with open(f"{args.root_dir}/src/gslm/tools/error_log", "a") as f:
-            for i in error_log:
-                f.write(i)
-                f.write("\n")
+        for i in error_log:
+            f.write(i)
+            f.write("\n")
 
     return losses
 
@@ -534,6 +534,7 @@ def process_librispeech_outputs(args, output, granularity, pooling, loss_type, d
     for utterance_info in pbar:
         # info
         if token: # word/phone level
+            print(utterance_info)
             id = utterance_info['id']
             flow_losses_timestamps = utterance_info['flow_losses_timestamps']
             token_losses_timestamps = utterance_info['token_losses_timestamps']
